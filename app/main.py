@@ -12,13 +12,14 @@ The file is organised top to bottom:
   5. Endpoints
 """
 import calendar
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
-from bson import Decimal128
+from bson import Decimal128, json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -351,39 +352,7 @@ def punch_in(body: PunchInIn):
     return attendance_out(doc)
 
 
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[DateStr] = None,
-    date_to: Optional[DateStr] = None,
-    status: Optional[Status] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-):
-    if date_from and date_to and date_from > date_to:  # ISO dates compare correctly as text
-        raise HTTPException(422, "date_from must not be after date_to")
 
-    query: dict = {}
-    if emp_code is not None:
-        query["emp_code"] = emp_code
-    date_range = {}
-    if date_from:
-        date_range["$gte"] = date_from
-    if date_to:
-        date_range["$lte"] = date_to
-    if date_range:
-        query["date"] = date_range
-    if status:
-        query["status"] = status
-
-    total = db.attendance_logs.count_documents(query)
-    cursor = (
-        db.attendance_logs.find(query, {"_id": 0})
-        .sort([("date", -1), ("emp_code", 1)])  # newest day first, then by employee code
-        .skip((page - 1) * page_size)  # the DATABASE sorts and slices; we never load everything
-        .limit(page_size)
-    )
-    return {"items": [attendance_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
     # =========================================================================== #
@@ -852,3 +821,128 @@ def department_trend(
             else round_half_up(Decimal(int(row["window_sum"])) / Decimal(window_count) / 10000, 4),
         })
     return {"department": department, "items": items}
+
+    # =========================================================================== #
+# PIECE 6: attendance list (rebuilt on shared helpers) and the explain endpoint
+# =========================================================================== #
+
+ATTENDANCE_SORT = [("date", -1), ("emp_code", 1)]  # newest day first, then by employee code
+
+
+def build_attendance_query(
+    emp_code: Optional[str], date_from: Optional[str], date_to: Optional[str], status: Optional[str]
+) -> dict:
+    """The MongoDB filter for the attendance list. Shared by the list endpoint and the explain endpoint."""
+    if date_from and date_to and date_from > date_to:  # ISO dates compare correctly as text
+        raise HTTPException(422, "date_from must not be after date_to")
+    query: dict = {}
+    if emp_code is not None:
+        query["emp_code"] = emp_code
+    date_range = {}
+    if date_from:
+        date_range["$gte"] = date_from
+    if date_to:
+        date_range["$lte"] = date_to
+    if date_range:
+        query["date"] = date_range
+    if status:
+        query["status"] = status
+    return query
+
+
+def attendance_hint(query: dict) -> str:
+    """Pick the index that fits the filter, so MongoDB never reads the whole collection."""
+    if "emp_code" in query:
+        return HINT_EMP_DATE  # (emp_code, date)
+    if "status" in query:
+        return "status_date_emp"  # (status, date desc, emp_code)
+    return HINT_DATE_EMP  # (date desc, emp_code)
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[DateStr] = None,
+    date_to: Optional[DateStr] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    query = build_attendance_query(emp_code, date_from, date_to, status)
+    hint = attendance_hint(query)
+    total = db.attendance_logs.count_documents(query, hint=hint)
+    cursor = (
+        db.attendance_logs.find(query, {"_id": 0})
+        .hint(hint)
+        .sort(ATTENDANCE_SORT)  # the DATABASE sorts and slices; we never load everything
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {"items": [attendance_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
+
+
+# ---------------------------------------------------------------------------- #
+# Explain endpoint
+# ---------------------------------------------------------------------------- #
+
+ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]
+
+
+def run_explain(command: dict) -> dict:
+    """Ask MongoDB to explain a command (with real execution statistics) and return it as plain JSON."""
+    result = db.command({"explain": command, "verbosity": "executionStats"})
+    return json.loads(json_util.dumps(result))  # converts dates, ObjectIds, etc. into JSON-safe values
+
+
+def explain_aggregate(collection: str, pipeline: list, hint: str) -> dict:
+    return run_explain({"aggregate": collection, "pipeline": pipeline, "cursor": {}, "hint": hint})
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Optional[MonthStr] = None,
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[DateStr] = None,
+    date_to: Optional[DateStr] = None,
+    status: Optional[Status] = None,
+    from_date: Annotated[Optional[DateStr], Query(alias="from")] = None,
+    to_date: Annotated[Optional[DateStr], Query(alias="to")] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    """Explains the main query of one endpoint, built by the SAME helper functions that endpoint uses."""
+    collection = "attendance_logs"
+
+    if endpoint == "attendance_list":
+        query = build_attendance_query(emp_code, date_from, date_to, status)
+        explain = run_explain({
+            "find": collection,
+            "filter": query,
+            "sort": dict(ATTENDANCE_SORT),
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+            "projection": {"_id": 0},
+            "hint": attendance_hint(query),
+        })
+    elif endpoint == "employee_monthly":
+        if emp_code is None or month is None:
+            raise HTTPException(422, "emp_code and month are required")
+        explain = explain_aggregate(collection, employee_monthly_pipeline(emp_code, month), HINT_EMP_DATE)
+    elif endpoint == "department_summary":
+        if month is None:
+            raise HTTPException(422, "month is required")
+        explain = explain_aggregate(collection, department_summary_pipeline(month, department), HINT_DATE_EMP)
+    elif endpoint == "late_leaderboard":
+        if month is None:
+            raise HTTPException(422, "month is required")
+        explain = explain_aggregate(collection, late_leaderboard_pipeline(month, limit, department), HINT_DATE_EMP)
+    else:  # department_trend
+        if department is None or from_date is None or to_date is None:
+            raise HTTPException(422, "department, from and to are required")
+        explain = explain_aggregate(
+            collection, build_department_trend_pipeline(department, from_date, to_date), HINT_DATE_EMP
+        )
+    return {"endpoint": endpoint, "collection": collection, "explain": explain}
