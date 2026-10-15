@@ -5,11 +5,13 @@ Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB   (a local .env file is read, but real environment variables win)
 
 The file is organised top to bottom:
-  1. Setup            - settings, database connection, indexes
+  1. Setup            - settings, database connection, indexes, error handling
   2. Time helpers     - epoch-millisecond <-> datetime, IST shift maths (rules R1-R5)
   3. Output helpers   - turn MongoDB documents into the JSON the contract wants
   4. Models           - request bodies with validation
-  5. Endpoints
+  5. Endpoints        - health, employees, punch-in, punch-out, correction (PATCH)
+  6. Analytics        - employee monthly, department summary, late leaderboard, department trend
+  7. Attendance list and the explain endpoint (proof that every query uses an index)
 """
 import calendar
 import json
@@ -274,9 +276,8 @@ def list_employees(
     return {"items": [employee_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
-
-    # =========================================================================== #
-# PIECE 2: shared types, attendance output helpers, punch-in, attendance list
+# =========================================================================== #
+# ATTENDANCE: shared types, output helpers and punch-in
 # =========================================================================== #
 
 def _check_real_date(value: str) -> str:
@@ -352,11 +353,8 @@ def punch_in(body: PunchInIn):
     return attendance_out(doc)
 
 
-
-
-
-    # =========================================================================== #
-# PIECE 3: punch-out and manual correction (regularization)
+# =========================================================================== #
+# ATTENDANCE: punch-out and manual correction (regularization)
 # =========================================================================== #
 
 MAX_SHIFT = timedelta(hours=24)  # a punch-out may be at most 24 hours after its punch-in
@@ -484,8 +482,8 @@ def regularize_attendance(emp_code: str, date: DateStr, body: RegularizeIn):  # 
     return attendance_out(updated)
 
 
-    # =========================================================================== #
-# PIECE 4: analytics - employee monthly and department summary
+# =========================================================================== #
+# ANALYTICS: employee monthly and department summary
 # =========================================================================== #
 
 # Index hints. Without a hint MongoDB may choose a full scan when most documents match;
@@ -656,8 +654,8 @@ def department_summary(month: MonthStr, department: Optional[str] = None):
     return {"month": month, "items": items}
 
 
-    # =========================================================================== #
-# PIECE 5: analytics - late leaderboard and department trend
+# =========================================================================== #
+# ANALYTICS: late leaderboard and department trend
 # =========================================================================== #
 
 HINT_DEPT_EMP = "dept_emp_code"  # employees: (department, emp_code)
@@ -822,8 +820,9 @@ def department_trend(
         })
     return {"department": department, "items": items}
 
-    # =========================================================================== #
-# PIECE 6: attendance list (rebuilt on shared helpers) and the explain endpoint
+
+# =========================================================================== #
+# ATTENDANCE LIST (filter, sort, page) and the EXPLAIN endpoint
 # =========================================================================== #
 
 ATTENDANCE_SORT = [("date", -1), ("emp_code", 1)]  # newest day first, then by employee code
